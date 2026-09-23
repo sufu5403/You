@@ -47,12 +47,20 @@
 - 開啟獨立可控的 Chrome 視窗
 - 讀取頁面內容摘要、點擊元素、輸入文字、按 Enter、捲動頁面、關閉瀏覽器
 
+### 電腦層級自動化（pyautogui，不限瀏覽器）
+- 滑鼠移動、點擊（左/右/中鍵、單擊/雙擊）、滾輪捲動
+- 鍵盤輸入文字（含中文，透過剪貼簿貼上）、單鍵按下、組合鍵（如 `ctrl+c`、`alt+tab`）
+- 螢幕解析度查詢、截圖存檔
+- **每次滑鼠/鍵盤操作前都會跳出確認視窗**，需使用者按「允許」才會真的執行，
+  拒絕或 30 秒未回應一律視為取消；另外保留 pyautogui 內建的安全機制——
+  滑鼠移到螢幕左上角 (0,0) 可強制中斷自動化
+
 ---
 
 ## 安裝
 
 ```bash
-pip install customtkinter google-genai pyttsx3 SpeechRecognition pyaudio selenium webdriver-manager
+pip install customtkinter google-genai pyttsx3 SpeechRecognition pyaudio selenium webdriver-manager pyautogui pyperclip
 ```
 
 若 Windows 上 `pyaudio` 直接安裝失敗：
@@ -128,15 +136,30 @@ python ai_assistant.py
 `open_browser` 與 `browser_navigate` 系列的差異：前者只是用系統預設瀏覽器開一個新分頁；
 後者啟動一個程式完全掌控、可被持續操作（點擊/輸入/捲動）的獨立 Chrome 視窗。
 
+| 工具 | 功能 | 需確認 |
+|---|---|---|
+| `get_screen_size()` | 取得螢幕解析度 | 否 |
+| `take_screenshot()` | 截圖存檔 | 否 |
+| `mouse_move(x, y)` | 移動滑鼠到指定座標 | 是 |
+| `mouse_click(x, y, button, double)` | 滑鼠點擊 | 是 |
+| `mouse_scroll(amount)` | 滾輪捲動 | 是 |
+| `keyboard_type(text)` | 輸入文字到目前作用中視窗 | 是 |
+| `keyboard_press(key)` | 按下單一按鍵 | 是 |
+| `keyboard_hotkey(keys)` | 組合鍵，如 `ctrl+c` | 是 |
+
+「電腦層級」的滑鼠/鍵盤工具會作用在**目前作用中的任何視窗**，不限瀏覽器；
+凡標記「需確認」的操作，執行前都會跳出彈窗，需使用者按「允許」才會真的執行。
+
 ---
 
 ## 已知限制
 
 - 語音辨識走 Google 線上服務，需要網路連線
-- 瀏覽器自動化目前沒有「危險操作二次確認」機制，請避免請它操作涉及刪除／付款／轉帳的頁面
-- 沒有滑鼠/鍵盤層級的通用桌面自動化（僅限瀏覽器）
+- 瀏覽器自動化沒有額外二次確認機制，請避免請它操作涉及刪除／付款／轉帳的頁面
+- 電腦層級滑鼠/鍵盤操作雖然有彈窗確認，但一旦按下「允許」，操作範圍就是**當下整台電腦的作用中視窗**，請留意確認視窗上顯示的內容是否符合你的預期
 - 沒有檔案讀寫、軟體安裝移除、系統設定變更等能力
 - 遇到 reCAPTCHA / Cloudflare 等防機器人機制的網站，瀏覽器自動化可能會被擋下
+- pyautogui 的座標操作是「盲操作」（沒有畫面辨識能力），AI 並不能真正「看到」螢幕內容，下座標前建議先用 `take_screenshot()` 讓使用者自行確認畫面狀態
 
 ---
 
