@@ -84,7 +84,16 @@ GEMINI_API_KEY = "你的 Gemini API Key"
 PROXY_BASE_URL = ""              # 若使用反代中繼站才填，留空則用官方端點
 MODEL_NAME = "gemini-3.6-flash"
 ASSISTANT_NAME = "鎮宇"
+REQUIRE_ACTION_CONFIRMATION = True   # 電腦層級滑鼠/鍵盤操作是否需要彈窗確認，見下方說明
 ```
+
+### 關於 `REQUIRE_ACTION_CONFIRMATION`
+
+- `True`（預設）：滑鼠移動/點擊、鍵盤輸入/組合鍵執行前會跳出確認視窗，需按「✅ 允許執行」才會真的動作。
+- `False`：不再跳出確認視窗，直接執行，只在聊天視窗留下一則「ℹ️ 正在執行：xxx」的提示訊息讓你知情，**不會等你回應**。
+
+> 關閉確認後，鎮宇對滑鼠鍵盤的操作將完全不等你同意就執行，請自行評估風險。
+> 開啟應用程式（`open_app`）不受此開關影響，一律會先跳出「ℹ️ 即將開啟應用程式：xxx」的提示訊息再實際開啟。
 
 ---
 
@@ -148,7 +157,8 @@ python ai_assistant.py
 | `keyboard_hotkey(keys)` | 組合鍵，如 `ctrl+c` | 是 |
 
 「電腦層級」的滑鼠/鍵盤工具會作用在**目前作用中的任何視窗**，不限瀏覽器；
-凡標記「需確認」的操作，執行前都會跳出彈窗，需使用者按「允許」才會真的執行。
+凡標記「需確認」的操作，是否真的跳出彈窗取決於 `REQUIRE_ACTION_CONFIRMATION` 設定
+（見上方「設定」章節）。`open_app` 一律會先發出提示訊息，不受此開關影響。
 
 ---
 
