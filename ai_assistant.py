@@ -13,6 +13,7 @@
     - 排程關機 / 分鐘倒數關機 / 取消關機
     - 開啟瀏覽器 / 開啟應用程式
     - 瀏覽器自動化操控（點擊、輸入文字、捲動、讀取頁面內容）
+    - 電腦層級滑鼠/鍵盤自動化（不限瀏覽器，操作前彈窗二次確認）
   打包建議：
     pyinstaller --noconsole --onefile --collect-all customtkinter ai_assistant.py
 ================================================================================
@@ -85,6 +86,25 @@ try:
 except ImportError:
     WEBDRIVER_MANAGER_AVAILABLE = False
 
+# ------------------------------------------------------------------------
+# pyautogui：電腦層級的滑鼠 / 鍵盤自動化（不限於瀏覽器）
+#   pip install pyautogui pyperclip
+#   pyperclip 用於輸入中文等非英數文字（透過剪貼簿貼上，
+#   因為 pyautogui.typewrite 本身只支援英數字元）
+# ------------------------------------------------------------------------
+try:
+    import pyautogui
+    pyautogui.FAILSAFE = True   # 安全機制：滑鼠移到螢幕左上角(0,0)可強制中斷自動化
+    PYAUTOGUI_AVAILABLE = True
+except ImportError:
+    PYAUTOGUI_AVAILABLE = False
+
+try:
+    import pyperclip
+    PYPERCLIP_AVAILABLE = True
+except ImportError:
+    PYPERCLIP_AVAILABLE = False
+
 import queue
 
 
@@ -97,12 +117,70 @@ PROXY_BASE_URL = ""                              # <-- 若使用反代中繼站�
                                                   #     留空則使用官方預設端點
 MODEL_NAME = "gemini-3.6-flash"
 ASSISTANT_NAME = "鎮宇"
+
+# 電腦層級操作（滑鼠移動/點擊、鍵盤輸入/組合鍵）是否需要彈窗跳出並等待你按「允許」才執行。
+#   True  ：跳出確認視窗，需你手動按下「允許執行」才會真的動作（較安全，預設值）
+#   False ：不阻擋、直接執行，只在聊天視窗留下一則「正在執行：xxx」的提示訊息讓你知情
+# 注意：關掉之後，鎮宇對滑鼠鍵盤的操作將不會再等你同意，請自行評估風險後再關閉。
+REQUIRE_ACTION_CONFIRMATION = True
 # ============================================================================
 # ▲▲▲ 使用者設定區 ▲▲▲
 # ============================================================================
 
 
 IS_WINDOWS = platform.system() == "Windows"
+
+
+# ============================================================================
+#  電腦層級操作的「使用者確認」機制
+#  ----------------------------------------------------------------------
+#  滑鼠移動/點擊、鍵盤輸入等操作風險較高（會影響使用者當下正在做的任何事），
+#  因此每次執行前都會透過此機制彈出確認視窗，阻塞等待使用者按下「允許」或
+#  「拒絕」，逾時則視為拒絕。彈窗必須在 GUI 主執行緒建立，因此這裡透過
+#  app.after(0, ...) 把顯示彈窗的工作排程回主執行緒，本身則在呼叫端
+#  （背景執行緒）阻塞等待結果。
+# ============================================================================
+
+_app_ref = {"app": None}
+
+
+def register_app_instance(app):
+    """讓工具函式能夠存取目前執行中的 AssistantApp 實例（用於彈出確認視窗/提示訊息）。"""
+    _app_ref["app"] = app
+
+
+def notify_action(description: str):
+    """
+    在聊天視窗留下一則不需要使用者回應的提示訊息（非阻塞）。
+    用於 REQUIRE_ACTION_CONFIRMATION = False 時的「事後告知」，
+    或是像開啟應用程式這類低風險操作的「事前警告」。
+    """
+    app = _app_ref.get("app")
+    if app is not None:
+        app.after(0, lambda: app._append_bubble(f"ℹ️ {description}", is_user=False))
+
+
+def request_user_confirmation(action_description: str, timeout: float = 30.0) -> bool:
+    """
+    依照 REQUIRE_ACTION_CONFIRMATION 設定決定行為：
+      - True ：彈出確認視窗並阻塞等待使用者回應；逾時或找不到 App 實例視為拒絕（安全預設）
+      - False：不阻擋，僅留下一則提示訊息，直接視為允許
+    必須在背景執行緒中呼叫。
+    """
+    if not REQUIRE_ACTION_CONFIRMATION:
+        notify_action(f"正在執行：{action_description}")
+        return True
+
+    app = _app_ref.get("app")
+    if app is None:
+        return False
+
+    event = threading.Event()
+    result = {"approved": False}
+
+    app.after(0, lambda: app._show_confirmation_dialog(action_description, event, result))
+    event.wait(timeout=timeout)
+    return result["approved"]
 
 
 # ============================================================================
@@ -218,6 +296,7 @@ def open_app(app_name: str) -> str:
     try:
         key = app_name.strip().lower()
         exe = APP_ALIAS_MAP.get(app_name.strip(), None) or APP_ALIAS_MAP.get(key, None) or app_name.strip()
+        notify_action(f"即將開啟應用程式：{exe}")
         if not IS_WINDOWS:
             return f"[模擬環境] 非 Windows 系統，無法實際啟動「{exe}」。"
         subprocess.Popen(exe, shell=True)
@@ -464,6 +543,166 @@ def browser_close() -> str:
         return f"關閉瀏覽器失敗：{e}"
 
 
+# ============================================================================
+#  電腦層級控制（滑鼠 / 鍵盤自動化，不限於瀏覽器）
+#  每個會實際操作滑鼠/鍵盤的工具，執行前都會呼叫 request_user_confirmation()
+#  跳出確認視窗，使用者必須按「允許」才會真的執行，拒絕或逾時一律取消。
+# ============================================================================
+
+def _ensure_pyautogui():
+    if not PYAUTOGUI_AVAILABLE:
+        raise RuntimeError("尚未安裝電腦自動化套件，請執行：pip install pyautogui pyperclip")
+
+
+def get_screen_size() -> str:
+    """取得目前螢幕解析度（唯讀，不需使用者確認）。"""
+    try:
+        _ensure_pyautogui()
+        w, h = pyautogui.size()
+        return f"目前螢幕解析度為 {w} x {h}。"
+    except Exception as e:
+        return f"取得螢幕大小失敗：{e}"
+
+
+def take_screenshot() -> str:
+    """
+    截取目前整個螢幕畫面並存成圖片檔（唯讀操作，不需使用者確認）。
+    存放於使用者桌面，檔名包含時間戳記。
+    """
+    try:
+        _ensure_pyautogui()
+        target_dir = os.path.join(os.path.expanduser("~"), "Desktop")
+        if not os.path.isdir(target_dir):
+            target_dir = os.getcwd()
+        filename = f"assistant_screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        filepath = os.path.join(target_dir, filename)
+        pyautogui.screenshot().save(filepath)
+        return f"已截圖並儲存至：{filepath}"
+    except Exception as e:
+        return f"截圖失敗：{e}"
+
+
+def mouse_move(x: int, y: int) -> str:
+    """
+    移動滑鼠到指定螢幕座標（不點擊）。需使用者確認。
+    Args:
+        x, y: 目標螢幕座標
+    """
+    try:
+        _ensure_pyautogui()
+        x, y = int(x), int(y)
+        if not request_user_confirmation(f"將滑鼠移動到座標 ({x}, {y})"):
+            return "使用者拒絕了這個操作，已取消。"
+        pyautogui.moveTo(x, y, duration=0.3)
+        return f"已將滑鼠移動到 ({x}, {y})。"
+    except Exception as e:
+        return f"移動滑鼠失敗：{e}"
+
+
+def mouse_click(x: int = None, y: int = None, button: str = "left", double: bool = False) -> str:
+    """
+    在指定座標（或目前滑鼠位置）執行滑鼠點擊。需使用者確認。
+    Args:
+        x, y: 目標座標（留空則在目前游標位置點擊）
+        button: 'left'、'right' 或 'middle'
+        double: 是否雙擊
+    """
+    try:
+        _ensure_pyautogui()
+        has_pos = x is not None and y is not None
+        if has_pos:
+            x, y = int(x), int(y)
+        pos_desc = f"({x}, {y})" if has_pos else "目前游標位置"
+        action = "雙擊" if double else "點擊"
+        if not request_user_confirmation(f"在 {pos_desc} 執行滑鼠{button}鍵{action}"):
+            return "使用者拒絕了這個操作，已取消。"
+        kwargs = {"button": button}
+        if has_pos:
+            kwargs["x"], kwargs["y"] = x, y
+        if double:
+            pyautogui.doubleClick(**kwargs)
+        else:
+            pyautogui.click(**kwargs)
+        return f"已在 {pos_desc} 執行{action}。"
+    except Exception as e:
+        return f"滑鼠點擊失敗：{e}"
+
+
+def mouse_scroll(amount: int) -> str:
+    """
+    捲動滑鼠滾輪。需使用者確認。
+    Args:
+        amount: 正數向上捲動，負數向下捲動
+    """
+    try:
+        _ensure_pyautogui()
+        amount = int(amount)
+        if not request_user_confirmation(f"捲動滑鼠滾輪 {amount} 單位"):
+            return "使用者拒絕了這個操作，已取消。"
+        pyautogui.scroll(amount)
+        return f"已捲動 {amount} 單位。"
+    except Exception as e:
+        return f"捲動失敗：{e}"
+
+
+def keyboard_type(text: str) -> str:
+    """
+    模擬鍵盤輸入文字到目前作用中的視窗（支援中文，透過剪貼簿貼上）。需使用者確認。
+    Args:
+        text: 要輸入的文字
+    """
+    try:
+        _ensure_pyautogui()
+        if not request_user_confirmation(f"在目前作用中的視窗輸入文字：「{text}」"):
+            return "使用者拒絕了這個操作，已取消。"
+        if text.isascii():
+            pyautogui.typewrite(text, interval=0.02)
+        else:
+            if not PYPERCLIP_AVAILABLE:
+                return "輸入中文等非英數文字需要安裝 pyperclip：pip install pyperclip"
+            pyperclip.copy(text)
+            pyautogui.hotkey("ctrl", "v")
+        return f"已輸入文字：{text}"
+    except Exception as e:
+        return f"輸入文字失敗：{e}"
+
+
+def keyboard_press(key: str) -> str:
+    """
+    模擬按下單一按鍵，例如 enter、esc、tab、f5、up、down、left、right、backspace。需使用者確認。
+    Args:
+        key: 按鍵名稱
+    """
+    try:
+        _ensure_pyautogui()
+        if not request_user_confirmation(f"按下按鍵：{key}"):
+            return "使用者拒絕了這個操作，已取消。"
+        pyautogui.press(key)
+        return f"已按下按鍵：{key}"
+    except Exception as e:
+        return f"按鍵操作失敗：{e}"
+
+
+def keyboard_hotkey(keys: str) -> str:
+    """
+    模擬組合鍵，例如 "ctrl+c"、"ctrl+v"、"alt+tab"、"win+d"。需使用者確認。
+    Args:
+        keys: 用加號分隔的按鍵組合，例如 "ctrl+c"
+    """
+    try:
+        _ensure_pyautogui()
+        key_list = [k.strip() for k in keys.split("+") if k.strip()]
+        if not key_list:
+            return "未指定任何按鍵。"
+        combo_desc = " + ".join(key_list)
+        if not request_user_confirmation(f"執行組合鍵：{combo_desc}"):
+            return "使用者拒絕了這個操作，已取消。"
+        pyautogui.hotkey(*key_list)
+        return f"已執行組合鍵：{combo_desc}"
+    except Exception as e:
+        return f"組合鍵操作失敗：{e}"
+
+
 # 工具名稱 -> 實際函式 的對應表，供 Function Calling 分派使用
 TOOL_FUNCTIONS = {
     "schedule_shutdown": schedule_shutdown,
@@ -478,6 +717,14 @@ TOOL_FUNCTIONS = {
     "browser_scroll": browser_scroll,
     "browser_get_page_summary": browser_get_page_summary,
     "browser_close": browser_close,
+    "get_screen_size": get_screen_size,
+    "take_screenshot": take_screenshot,
+    "mouse_move": mouse_move,
+    "mouse_click": mouse_click,
+    "mouse_scroll": mouse_scroll,
+    "keyboard_type": keyboard_type,
+    "keyboard_press": keyboard_press,
+    "keyboard_hotkey": keyboard_hotkey,
 }
 
 
@@ -668,6 +915,96 @@ class GeminiBrain:
             parameters={"type": "OBJECT", "properties": {}},
         )
 
+        get_screen_size_decl = types.FunctionDeclaration(
+            name="get_screen_size",
+            description="取得目前螢幕解析度（寬 x 高，像素）。在移動滑鼠或點擊特定座標前，建議先確認螢幕大小。",
+            parameters={"type": "OBJECT", "properties": {}},
+        )
+
+        take_screenshot_decl = types.FunctionDeclaration(
+            name="take_screenshot",
+            description="截取目前整個螢幕畫面並存成圖片檔，回傳存放路徑，方便使用者事後查看畫面狀態。",
+            parameters={"type": "OBJECT", "properties": {}},
+        )
+
+        mouse_move_decl = types.FunctionDeclaration(
+            name="mouse_move",
+            description="移動滑鼠游標到指定的螢幕座標（不點擊）。這是電腦層級操作，會跳出確認視窗給使用者。",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "x": {"type": "INTEGER", "description": "目標 X 座標（像素）"},
+                    "y": {"type": "INTEGER", "description": "目標 Y 座標（像素）"},
+                },
+                "required": ["x", "y"],
+            },
+        )
+
+        mouse_click_decl = types.FunctionDeclaration(
+            name="mouse_click",
+            description="在指定座標（或目前游標位置）執行滑鼠點擊。這是電腦層級操作，會跳出確認視窗給使用者。",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "x": {"type": "INTEGER", "description": "目標 X 座標，留空則在目前游標位置點擊"},
+                    "y": {"type": "INTEGER", "description": "目標 Y 座標，留空則在目前游標位置點擊"},
+                    "button": {"type": "STRING", "description": "'left'、'right' 或 'middle'，預設 left"},
+                    "double": {"type": "BOOLEAN", "description": "是否雙擊，預設 false"},
+                },
+            },
+        )
+
+        mouse_scroll_decl = types.FunctionDeclaration(
+            name="mouse_scroll",
+            description="捲動滑鼠滾輪（作用於目前作用中的視窗，不限瀏覽器）。這是電腦層級操作，會跳出確認視窗給使用者。",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "amount": {"type": "INTEGER", "description": "正數向上捲動，負數向下捲動"},
+                },
+                "required": ["amount"],
+            },
+        )
+
+        keyboard_type_decl = types.FunctionDeclaration(
+            name="keyboard_type",
+            description=(
+                "模擬鍵盤輸入文字到目前作用中的視窗（支援中文）。"
+                "這是電腦層級操作，作用範圍是使用者『目前聚焦』的任何程式視窗，不限瀏覽器。會跳出確認視窗給使用者。"
+            ),
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "text": {"type": "STRING", "description": "要輸入的文字內容"},
+                },
+                "required": ["text"],
+            },
+        )
+
+        keyboard_press_decl = types.FunctionDeclaration(
+            name="keyboard_press",
+            description="模擬按下單一按鍵，例如 enter、esc、tab、f5、up、down、left、right、backspace。這是電腦層級操作，會跳出確認視窗給使用者。",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "key": {"type": "STRING", "description": "按鍵名稱"},
+                },
+                "required": ["key"],
+            },
+        )
+
+        keyboard_hotkey_decl = types.FunctionDeclaration(
+            name="keyboard_hotkey",
+            description="模擬組合鍵，例如 'ctrl+c'、'ctrl+v'、'alt+tab'、'win+d'。這是電腦層級操作，會跳出確認視窗給使用者。",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "keys": {"type": "STRING", "description": "用加號分隔的按鍵組合，例如 'ctrl+c'"},
+                },
+                "required": ["keys"],
+            },
+        )
+
         return [
             types.Tool(
                 function_declarations=[
@@ -683,6 +1020,14 @@ class GeminiBrain:
                     browser_scroll_decl,
                     browser_get_page_summary_decl,
                     browser_close_decl,
+                    get_screen_size_decl,
+                    take_screenshot_decl,
+                    mouse_move_decl,
+                    mouse_click_decl,
+                    mouse_scroll_decl,
+                    keyboard_type_decl,
+                    keyboard_press_decl,
+                    keyboard_hotkey_decl,
                 ]
             )
         ]
@@ -706,6 +1051,12 @@ class GeminiBrain:
             f"browser_press_enter、browser_scroll 等工具完成任務，完成後可視情況呼叫 browser_close。\n"
             f"操作瀏覽器時請每次只做一個明確步驟，並在必要時用 browser_get_page_summary 確認結果，"
             f"避免連續盲目點擊。\n"
+            f"若使用者要求的是『電腦層級』的操作——控制瀏覽器以外的其他任意程式視窗，例如移動滑鼠、"
+            f"點擊螢幕上特定座標、輸入文字到某個軟體、按組合鍵（如 alt+tab、ctrl+c）——請使用 "
+            f"mouse_move、mouse_click、mouse_scroll、keyboard_type、keyboard_press、keyboard_hotkey "
+            f"這些工具。這些操作會自動跳出視窗請使用者確認，你不需要事先用文字再三詢問是否要執行，"
+            f"直接呼叫工具即可，系統會處理確認流程；若使用者拒絕，如實告知即可。"
+            f"需要座標時可先呼叫 get_screen_size 了解螢幕大小，或用 take_screenshot 截圖供使用者確認畫面狀態。\n"
             f"若使用者想開啟應用程式，也請呼叫對應工具完成，而非只是用文字說明步驟。\n"
             f"完成工具呼叫後，請用簡短自然的口語向使用者確認結果。"
         )
@@ -1095,6 +1446,7 @@ class AssistantApp(ctk.CTk):
         self.brain = GeminiBrain(GEMINI_API_KEY, PROXY_BASE_URL, MODEL_NAME)
         self.speech = SpeechEngine()
         self.voice_input = VoiceInputEngine()
+        register_app_instance(self)  # 讓電腦層級工具（滑鼠/鍵盤）能呼叫本視窗跳出確認彈窗
 
         self._build_ui()
 
@@ -1104,8 +1456,62 @@ class AssistantApp(ctk.CTk):
             self._append_bubble(f"⚠️ 語音回覆功能未啟用：{self.speech.error}", is_user=False)
         if self.voice_input.error:
             self._append_bubble(f"⚠️ 通話模式（麥克風輸入）未啟用：{self.voice_input.error}", is_user=False)
+        if not PYAUTOGUI_AVAILABLE:
+            self._append_bubble(
+                "⚠️ 電腦層級操作（滑鼠/鍵盤自動化）未啟用：請執行 pip install pyautogui pyperclip",
+                is_user=False,
+            )
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ------------------------------------------------------------------
+    # 電腦層級操作確認彈窗（由 request_user_confirmation() 排程呼叫）
+    # ------------------------------------------------------------------
+    def _show_confirmation_dialog(self, description: str, event: threading.Event, result: dict):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("需要您的確認")
+        dialog.geometry("380x200")
+        dialog.attributes("-topmost", True)
+        dialog.configure(fg_color=COLOR_PANEL)
+        dialog.resizable(False, False)
+        try:
+            dialog.grab_set()
+        except Exception:
+            pass
+
+        ctk.CTkLabel(
+            dialog, text="⚠️ 電腦層級操作確認",
+            font=ctk.CTkFont(size=15, weight="bold"), text_color=COLOR_DANGER,
+        ).pack(pady=(20, 8))
+
+        ctk.CTkLabel(
+            dialog, text=f"{ASSISTANT_NAME} 想要執行：\n{description}",
+            font=ctk.CTkFont(size=13), wraplength=330, justify="center",
+        ).pack(padx=16, pady=(0, 10))
+
+        def finish(approved: bool):
+            result["approved"] = approved
+            event.set()
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(pady=14)
+
+        ctk.CTkButton(
+            btn_frame, text="✅ 允許執行", width=120, fg_color=COLOR_ONLINE,
+            hover_color="#2ea043", command=lambda: finish(True),
+        ).pack(side="left", padx=8)
+
+        ctk.CTkButton(
+            btn_frame, text="❌ 拒絕", width=120, fg_color=COLOR_DANGER,
+            hover_color="#c0392b", command=lambda: finish(False),
+        ).pack(side="left", padx=8)
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: finish(False))
 
     # ------------------------------------------------------------------
     # UI 建構
@@ -1416,6 +1822,7 @@ class AssistantApp(ctk.CTk):
             browser_controller.close()
         except Exception:
             pass
+        register_app_instance(None)
         self.destroy()
 
 
