@@ -5,15 +5,16 @@
   ----------------------------------------------------------------------------
   技術棧：
     - GUI       : customtkinter (dark / blue)
-    - AI 大腦   : google-genai SDK (gemini-2.5-flash) + Function Calling
+    - AI 大腦   : google-genai SDK (gemini-3.6-flash，文字模式) +
+                  Gemini Live API (gemini-3.1-flash-live-preview，通話模式即時語音)
     - 系統控制  : shutdown / subprocess / webbrowser
   功能：
-    - 通話模式風格聊天介面（文字模式 / 語音通話模式可切換）
+    - 文字模式（打字對話）與通話模式（Gemini Live 即時雙向語音，支援隨時插話打斷）
     - 螢幕懸浮膠囊 (Picture-in-Picture)
-    - 排程關機 / 分鐘倒數關機 / 取消關機
+    - 排程關機 / 分鐘倒數關機 / 取消關機（文字或語音跟鎮宇說即可，無專屬按鈕）
     - 開啟瀏覽器 / 開啟應用程式
     - 瀏覽器自動化操控（點擊、輸入文字、捲動、讀取頁面內容）
-    - 電腦層級滑鼠/鍵盤自動化（不限瀏覽器，操作前彈窗二次確認）
+    - 電腦層級滑鼠/鍵盤自動化（不限瀏覽器，操作前彈窗二次確認，可於設定關閉）
   打包建議：
     pyinstaller --noconsole --onefile --collect-all customtkinter ai_assistant.py
 ================================================================================
@@ -43,27 +44,18 @@ except ImportError:
     GENAI_AVAILABLE = False
 
 # ------------------------------------------------------------------------
-# pyttsx3：離線文字轉語音（TTS），不需要額外的雲端金鑰
-#   pip install pyttsx3
-#   Windows 上會使用系統內建的 SAPI5 語音引擎
-# ------------------------------------------------------------------------
-try:
-    import pyttsx3
-    PYTTSX3_AVAILABLE = True
-except ImportError:
-    PYTTSX3_AVAILABLE = False
-
-# ------------------------------------------------------------------------
-# SpeechRecognition：語音辨識（STT），通話模式用麥克風輸入靠這個
-#   pip install SpeechRecognition pyaudio
-#   （Windows 上 pyaudio 若直接 pip install 失敗，可改用：
+# pyaudio + asyncio：Gemini Live 即時語音通話所需的音訊串流與非同步事件迴圈
+#   pip install pyaudio
+#   （Windows 上若直接 pip install pyaudio 失敗，可改用：
 #     pip install pipwin && pipwin install pyaudio）
 # ------------------------------------------------------------------------
 try:
-    import speech_recognition as sr
-    SR_AVAILABLE = True
+    import pyaudio
+    PYAUDIO_AVAILABLE = True
 except ImportError:
-    SR_AVAILABLE = False
+    PYAUDIO_AVAILABLE = False
+
+import asyncio
 
 # ------------------------------------------------------------------------
 # Selenium：讓 AI 真正操控瀏覽器（點擊、輸入文字、捲動、讀取頁面內容）
@@ -105,13 +97,11 @@ try:
 except ImportError:
     PYPERCLIP_AVAILABLE = False
 
-import queue
-
 
 # ============================================================================
 # ▼▼▼ 使用者設定區（請在此填入你的金鑰 / 反代網址）▼▼▼
 # ============================================================================
-GEMINI_API_KEY = "AQ.Ab8RN6J8JjiG10boBe0xLex3ny7o3DxgfGQbiACo29TuoQF4pQ"     # <-- 你的 Gemini API Key
+GEMINI_API_KEY = "AQ.Ab8RN6LufaNAh2h6ChcUIFTcTI_OnXESDMRDswVKgqUbnJ0P4A"     # <-- 你的 Gemini API Key
 PROXY_BASE_URL = ""                              # <-- 若使用反代中繼站，請填入 base_url，例如：
                                                   #     "https://your-proxy-domain.com/v1"
                                                   #     留空則使用官方預設端點
@@ -732,6 +722,339 @@ TOOL_FUNCTIONS = {
 #  Gemini AI 大腦封裝
 # ============================================================================
 
+def build_shared_tools():
+    """建立 Function Calling 的工具定義，文字模式（GeminiBrain）與語音模式（GeminiLiveController）共用。"""
+    schedule_shutdown_decl = types.FunctionDeclaration(
+        name="schedule_shutdown",
+        description="在指定的今天或明天時間點執行電腦關機，時間格式為 HH:MM（24小時制）。",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "target_time_str": {
+                    "type": "STRING",
+                    "description": "目標關機時間，24小時制字串，例如 '23:30' 或 '08:00'",
+                }
+            },
+            "required": ["target_time_str"],
+        },
+    )
+
+    shutdown_in_minutes_decl = types.FunctionDeclaration(
+        name="shutdown_in_minutes",
+        description="從現在開始，經過指定的分鐘數後關機。",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "minutes": {
+                    "type": "INTEGER",
+                    "description": "幾分鐘後關機，例如 30",
+                }
+            },
+            "required": ["minutes"],
+        },
+    )
+
+    cancel_shutdown_decl = types.FunctionDeclaration(
+        name="cancel_shutdown",
+        description="取消目前已經排程但尚未執行的關機動作。",
+        parameters={"type": "OBJECT", "properties": {}},
+    )
+
+    open_browser_decl = types.FunctionDeclaration(
+        name="open_browser",
+        description="開啟瀏覽器並前往指定網址，或使用關鍵字進行 Google 搜尋。",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "url_or_keyword": {
+                    "type": "STRING",
+                    "description": "完整網址（含 http/https）或搜尋關鍵字",
+                }
+            },
+            "required": ["url_or_keyword"],
+        },
+    )
+
+    open_app_decl = types.FunctionDeclaration(
+        name="open_app",
+        description="開啟 Windows 應用程式，例如記事本、小算盤、小畫家等。",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "app_name": {
+                    "type": "STRING",
+                    "description": "應用程式名稱，例如 notepad、calc，或中文名稱如「記事本」",
+                }
+            },
+            "required": ["app_name"],
+        },
+    )
+
+    browser_navigate_decl = types.FunctionDeclaration(
+        name="browser_navigate",
+        description=(
+            "開啟或沿用一個由程式完全掌控的自動化瀏覽器視窗，並導覽至指定網址或關鍵字搜尋。"
+            "這與 open_browser 不同：open_browser 只是用系統預設瀏覽器開一個新分頁；"
+            "而這個工具開出來的瀏覽器可以被 browser_click / browser_type_text 等工具繼續操作。"
+            "想要『操控』網頁（點擊、輸入、瀏覽內容）時，請一律先呼叫這個工具。"
+        ),
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "url_or_keyword": {
+                    "type": "STRING",
+                    "description": "完整網址（含 http/https）或搜尋關鍵字",
+                }
+            },
+            "required": ["url_or_keyword"],
+        },
+    )
+
+    browser_click_decl = types.FunctionDeclaration(
+        name="browser_click",
+        description="在目前自動化瀏覽器頁面上，點擊包含指定文字的連結或按鈕。",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "text": {
+                    "type": "STRING",
+                    "description": "要點擊的元素上顯示的文字，例如「登入」「下一步」「立即購買」",
+                }
+            },
+            "required": ["text"],
+        },
+    )
+
+    browser_type_text_decl = types.FunctionDeclaration(
+        name="browser_type_text",
+        description="在目前自動化瀏覽器頁面的輸入欄位中填入文字（例如搜尋框、表單欄位）。",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "value": {
+                    "type": "STRING",
+                    "description": "要輸入的文字內容",
+                },
+                "field_hint": {
+                    "type": "STRING",
+                    "description": "（選填）辨識目標欄位的提示，例如「搜尋」「帳號」「email」；留空則填入頁面上第一個可見輸入框",
+                },
+            },
+            "required": ["value"],
+        },
+    )
+
+    browser_press_enter_decl = types.FunctionDeclaration(
+        name="browser_press_enter",
+        description="在目前聚焦的輸入欄位模擬按下 Enter 鍵，常用於送出搜尋或表單。",
+        parameters={"type": "OBJECT", "properties": {}},
+    )
+
+    browser_scroll_decl = types.FunctionDeclaration(
+        name="browser_scroll",
+        description="捲動目前自動化瀏覽器頁面。",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "direction": {
+                    "type": "STRING",
+                    "description": "捲動方向，'down'（向下，預設）或 'up'（向上）",
+                }
+            },
+        },
+    )
+
+    browser_get_page_summary_decl = types.FunctionDeclaration(
+        name="browser_get_page_summary",
+        description=(
+            "讀取目前自動化瀏覽器頁面的標題、網址與內容摘要。"
+            "在執行 browser_click 或 browser_type_text 之前，建議先呼叫這個工具了解頁面上實際有什麼內容與可互動元素。"
+        ),
+        parameters={"type": "OBJECT", "properties": {}},
+    )
+
+    browser_close_decl = types.FunctionDeclaration(
+        name="browser_close",
+        description="關閉目前的自動化瀏覽器視窗。",
+        parameters={"type": "OBJECT", "properties": {}},
+    )
+
+    get_screen_size_decl = types.FunctionDeclaration(
+        name="get_screen_size",
+        description="取得目前螢幕解析度（寬 x 高，像素）。在移動滑鼠或點擊特定座標前，建議先確認螢幕大小。",
+        parameters={"type": "OBJECT", "properties": {}},
+    )
+
+    take_screenshot_decl = types.FunctionDeclaration(
+        name="take_screenshot",
+        description="截取目前整個螢幕畫面並存成圖片檔，回傳存放路徑，方便使用者事後查看畫面狀態。",
+        parameters={"type": "OBJECT", "properties": {}},
+    )
+
+    mouse_move_decl = types.FunctionDeclaration(
+        name="mouse_move",
+        description="移動滑鼠游標到指定的螢幕座標（不點擊）。這是電腦層級操作，會跳出確認視窗給使用者。",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "x": {"type": "INTEGER", "description": "目標 X 座標（像素）"},
+                "y": {"type": "INTEGER", "description": "目標 Y 座標（像素）"},
+            },
+            "required": ["x", "y"],
+        },
+    )
+
+    mouse_click_decl = types.FunctionDeclaration(
+        name="mouse_click",
+        description="在指定座標（或目前游標位置）執行滑鼠點擊。這是電腦層級操作，會跳出確認視窗給使用者。",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "x": {"type": "INTEGER", "description": "目標 X 座標，留空則在目前游標位置點擊"},
+                "y": {"type": "INTEGER", "description": "目標 Y 座標，留空則在目前游標位置點擊"},
+                "button": {"type": "STRING", "description": "'left'、'right' 或 'middle'，預設 left"},
+                "double": {"type": "BOOLEAN", "description": "是否雙擊，預設 false"},
+            },
+        },
+    )
+
+    mouse_scroll_decl = types.FunctionDeclaration(
+        name="mouse_scroll",
+        description="捲動滑鼠滾輪（作用於目前作用中的視窗，不限瀏覽器）。這是電腦層級操作，會跳出確認視窗給使用者。",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "amount": {"type": "INTEGER", "description": "正數向上捲動，負數向下捲動"},
+            },
+            "required": ["amount"],
+        },
+    )
+
+    keyboard_type_decl = types.FunctionDeclaration(
+        name="keyboard_type",
+        description=(
+            "模擬鍵盤輸入文字到目前作用中的視窗（支援中文）。"
+            "這是電腦層級操作，作用範圍是使用者『目前聚焦』的任何程式視窗，不限瀏覽器。會跳出確認視窗給使用者。"
+        ),
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "text": {"type": "STRING", "description": "要輸入的文字內容"},
+            },
+            "required": ["text"],
+        },
+    )
+
+    keyboard_press_decl = types.FunctionDeclaration(
+        name="keyboard_press",
+        description="模擬按下單一按鍵，例如 enter、esc、tab、f5、up、down、left、right、backspace。這是電腦層級操作，會跳出確認視窗給使用者。",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "key": {"type": "STRING", "description": "按鍵名稱"},
+            },
+            "required": ["key"],
+        },
+    )
+
+    keyboard_hotkey_decl = types.FunctionDeclaration(
+        name="keyboard_hotkey",
+        description="模擬組合鍵，例如 'ctrl+c'、'ctrl+v'、'alt+tab'、'win+d'。這是電腦層級操作，會跳出確認視窗給使用者。",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "keys": {"type": "STRING", "description": "用加號分隔的按鍵組合，例如 'ctrl+c'"},
+            },
+            "required": ["keys"],
+        },
+    )
+
+    return [
+        types.Tool(
+            function_declarations=[
+                schedule_shutdown_decl,
+                shutdown_in_minutes_decl,
+                cancel_shutdown_decl,
+                open_browser_decl,
+                open_app_decl,
+                browser_navigate_decl,
+                browser_click_decl,
+                browser_type_text_decl,
+                browser_press_enter_decl,
+                browser_scroll_decl,
+                browser_get_page_summary_decl,
+                browser_close_decl,
+                get_screen_size_decl,
+                take_screenshot_decl,
+                mouse_move_decl,
+                mouse_click_decl,
+                mouse_scroll_decl,
+                keyboard_type_decl,
+                keyboard_press_decl,
+                keyboard_hotkey_decl,
+            ]
+        )
+    ]
+
+
+def build_shared_system_instruction(voice_mode: bool = False) -> str:
+    """
+    建立 System Instruction，文字模式（GeminiBrain）與語音模式（GeminiLiveController）共用。
+    Args:
+        voice_mode: True 時會額外提醒模型目前是即時語音通話（回覆應簡短口語化，避免條列/長篇大論）。
+    """
+    now = datetime.now()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    weekday_map = ["一", "二", "三", "四", "五", "六", "日"]
+    weekday_str = weekday_map[now.weekday()]
+
+    base = (
+        f"你是一位名叫「{ASSISTANT_NAME}」的桌面語音助理，個性親切、簡潔、有效率，"
+        f"以繁體中文回應使用者。\n"
+        f"目前系統時間為：{now_str}（星期{weekday_str}）。\n"
+        f"當使用者提到與時間相關的關機需求時（例如「晚點關機」「半小時後關機」「晚上11點關機」），"
+        f"請你依照目前系統時間精準換算，並呼叫對應的工具函式完成任務，不要只用文字回答而不呼叫工具。\n"
+        f"若使用者只是想『開啟』某個網站或搜尋資訊（不需要進一步互動），請用 open_browser。\n"
+        f"若使用者想要你『操作』網頁——例如點擊按鈕、在欄位輸入文字、捲動頁面、幫忙填表單、"
+        f"查詢頁面上的資訊——請改用 browser_navigate 開啟頁面，並視需要搭配 "
+        f"browser_get_page_summary（先了解頁面內容）、browser_click、browser_type_text、"
+        f"browser_press_enter、browser_scroll 等工具完成任務，完成後可視情況呼叫 browser_close。\n"
+        f"操作瀏覽器時請每次只做一個明確步驟，並在必要時用 browser_get_page_summary 確認結果，"
+        f"避免連續盲目點擊。\n"
+        f"若使用者要求的是『電腦層級』的操作——控制瀏覽器以外的其他任意程式視窗，例如移動滑鼠、"
+        f"點擊螢幕上特定座標、輸入文字到某個軟體、按組合鍵（如 alt+tab、ctrl+c）——請使用 "
+        f"mouse_move、mouse_click、mouse_scroll、keyboard_type、keyboard_press、keyboard_hotkey "
+        f"這些工具。這些操作會自動跳出視窗請使用者確認，你不需要事先用文字再三詢問是否要執行，"
+        f"直接呼叫工具即可，系統會處理確認流程；若使用者拒絕，如實告知即可。"
+        f"需要座標時可先呼叫 get_screen_size 了解螢幕大小，或用 take_screenshot 截圖供使用者確認畫面狀態。\n"
+        f"若使用者想開啟應用程式，也請呼叫對應工具完成，而非只是用文字說明步驟。\n"
+        f"完成工具呼叫後，請用簡短自然的口語向使用者確認結果。"
+    )
+
+    if voice_mode:
+        base += (
+            "\n目前是即時語音通話模式：使用者是用『說話』跟你互動，你的回覆也會直接用語音唸出來。"
+            "請用簡短、口語化、像講電話一樣的方式回答，避免條列式清單或長篇大論；"
+            "使用者隨時可能中途插話打斷你，這是正常現象，請自然銜接。"
+        )
+
+    return base
+
+
+def dispatch_function_call(function_call) -> dict:
+    """執行單一 function call，回傳結果 dict。文字模式與語音模式共用同一套分派邏輯。"""
+    name = function_call.name
+    args = dict(function_call.args) if function_call.args else {}
+    func = TOOL_FUNCTIONS.get(name)
+    if func is None:
+        return {"error": f"未知的工具：{name}"}
+    try:
+        result_text = func(**args)
+        return {"result": result_text}
+    except Exception as e:
+        return {"error": f"執行工具 {name} 時發生例外：{e}"}
+
+
 class GeminiBrain:
     """封裝 google-genai SDK 呼叫、動態 System Instruction 與 Function Calling 分派。"""
 
@@ -757,323 +1080,6 @@ class GeminiBrain:
         except Exception as e:
             self.error = f"初始化 Gemini Client 失敗：{e}"
 
-    # -- 工具定義（Function Declarations） ---------------------------------
-    @staticmethod
-    def _build_tools():
-        schedule_shutdown_decl = types.FunctionDeclaration(
-            name="schedule_shutdown",
-            description="在指定的今天或明天時間點執行電腦關機，時間格式為 HH:MM（24小時制）。",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "target_time_str": {
-                        "type": "STRING",
-                        "description": "目標關機時間，24小時制字串，例如 '23:30' 或 '08:00'",
-                    }
-                },
-                "required": ["target_time_str"],
-            },
-        )
-
-        shutdown_in_minutes_decl = types.FunctionDeclaration(
-            name="shutdown_in_minutes",
-            description="從現在開始，經過指定的分鐘數後關機。",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "minutes": {
-                        "type": "INTEGER",
-                        "description": "幾分鐘後關機，例如 30",
-                    }
-                },
-                "required": ["minutes"],
-            },
-        )
-
-        cancel_shutdown_decl = types.FunctionDeclaration(
-            name="cancel_shutdown",
-            description="取消目前已經排程但尚未執行的關機動作。",
-            parameters={"type": "OBJECT", "properties": {}},
-        )
-
-        open_browser_decl = types.FunctionDeclaration(
-            name="open_browser",
-            description="開啟瀏覽器並前往指定網址，或使用關鍵字進行 Google 搜尋。",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "url_or_keyword": {
-                        "type": "STRING",
-                        "description": "完整網址（含 http/https）或搜尋關鍵字",
-                    }
-                },
-                "required": ["url_or_keyword"],
-            },
-        )
-
-        open_app_decl = types.FunctionDeclaration(
-            name="open_app",
-            description="開啟 Windows 應用程式，例如記事本、小算盤、小畫家等。",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "app_name": {
-                        "type": "STRING",
-                        "description": "應用程式名稱，例如 notepad、calc，或中文名稱如「記事本」",
-                    }
-                },
-                "required": ["app_name"],
-            },
-        )
-
-        browser_navigate_decl = types.FunctionDeclaration(
-            name="browser_navigate",
-            description=(
-                "開啟或沿用一個由程式完全掌控的自動化瀏覽器視窗，並導覽至指定網址或關鍵字搜尋。"
-                "這與 open_browser 不同：open_browser 只是用系統預設瀏覽器開一個新分頁；"
-                "而這個工具開出來的瀏覽器可以被 browser_click / browser_type_text 等工具繼續操作。"
-                "想要『操控』網頁（點擊、輸入、瀏覽內容）時，請一律先呼叫這個工具。"
-            ),
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "url_or_keyword": {
-                        "type": "STRING",
-                        "description": "完整網址（含 http/https）或搜尋關鍵字",
-                    }
-                },
-                "required": ["url_or_keyword"],
-            },
-        )
-
-        browser_click_decl = types.FunctionDeclaration(
-            name="browser_click",
-            description="在目前自動化瀏覽器頁面上，點擊包含指定文字的連結或按鈕。",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "text": {
-                        "type": "STRING",
-                        "description": "要點擊的元素上顯示的文字，例如「登入」「下一步」「立即購買」",
-                    }
-                },
-                "required": ["text"],
-            },
-        )
-
-        browser_type_text_decl = types.FunctionDeclaration(
-            name="browser_type_text",
-            description="在目前自動化瀏覽器頁面的輸入欄位中填入文字（例如搜尋框、表單欄位）。",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "value": {
-                        "type": "STRING",
-                        "description": "要輸入的文字內容",
-                    },
-                    "field_hint": {
-                        "type": "STRING",
-                        "description": "（選填）辨識目標欄位的提示，例如「搜尋」「帳號」「email」；留空則填入頁面上第一個可見輸入框",
-                    },
-                },
-                "required": ["value"],
-            },
-        )
-
-        browser_press_enter_decl = types.FunctionDeclaration(
-            name="browser_press_enter",
-            description="在目前聚焦的輸入欄位模擬按下 Enter 鍵，常用於送出搜尋或表單。",
-            parameters={"type": "OBJECT", "properties": {}},
-        )
-
-        browser_scroll_decl = types.FunctionDeclaration(
-            name="browser_scroll",
-            description="捲動目前自動化瀏覽器頁面。",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "direction": {
-                        "type": "STRING",
-                        "description": "捲動方向，'down'（向下，預設）或 'up'（向上）",
-                    }
-                },
-            },
-        )
-
-        browser_get_page_summary_decl = types.FunctionDeclaration(
-            name="browser_get_page_summary",
-            description=(
-                "讀取目前自動化瀏覽器頁面的標題、網址與內容摘要。"
-                "在執行 browser_click 或 browser_type_text 之前，建議先呼叫這個工具了解頁面上實際有什麼內容與可互動元素。"
-            ),
-            parameters={"type": "OBJECT", "properties": {}},
-        )
-
-        browser_close_decl = types.FunctionDeclaration(
-            name="browser_close",
-            description="關閉目前的自動化瀏覽器視窗。",
-            parameters={"type": "OBJECT", "properties": {}},
-        )
-
-        get_screen_size_decl = types.FunctionDeclaration(
-            name="get_screen_size",
-            description="取得目前螢幕解析度（寬 x 高，像素）。在移動滑鼠或點擊特定座標前，建議先確認螢幕大小。",
-            parameters={"type": "OBJECT", "properties": {}},
-        )
-
-        take_screenshot_decl = types.FunctionDeclaration(
-            name="take_screenshot",
-            description="截取目前整個螢幕畫面並存成圖片檔，回傳存放路徑，方便使用者事後查看畫面狀態。",
-            parameters={"type": "OBJECT", "properties": {}},
-        )
-
-        mouse_move_decl = types.FunctionDeclaration(
-            name="mouse_move",
-            description="移動滑鼠游標到指定的螢幕座標（不點擊）。這是電腦層級操作，會跳出確認視窗給使用者。",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "x": {"type": "INTEGER", "description": "目標 X 座標（像素）"},
-                    "y": {"type": "INTEGER", "description": "目標 Y 座標（像素）"},
-                },
-                "required": ["x", "y"],
-            },
-        )
-
-        mouse_click_decl = types.FunctionDeclaration(
-            name="mouse_click",
-            description="在指定座標（或目前游標位置）執行滑鼠點擊。這是電腦層級操作，會跳出確認視窗給使用者。",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "x": {"type": "INTEGER", "description": "目標 X 座標，留空則在目前游標位置點擊"},
-                    "y": {"type": "INTEGER", "description": "目標 Y 座標，留空則在目前游標位置點擊"},
-                    "button": {"type": "STRING", "description": "'left'、'right' 或 'middle'，預設 left"},
-                    "double": {"type": "BOOLEAN", "description": "是否雙擊，預設 false"},
-                },
-            },
-        )
-
-        mouse_scroll_decl = types.FunctionDeclaration(
-            name="mouse_scroll",
-            description="捲動滑鼠滾輪（作用於目前作用中的視窗，不限瀏覽器）。這是電腦層級操作，會跳出確認視窗給使用者。",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "amount": {"type": "INTEGER", "description": "正數向上捲動，負數向下捲動"},
-                },
-                "required": ["amount"],
-            },
-        )
-
-        keyboard_type_decl = types.FunctionDeclaration(
-            name="keyboard_type",
-            description=(
-                "模擬鍵盤輸入文字到目前作用中的視窗（支援中文）。"
-                "這是電腦層級操作，作用範圍是使用者『目前聚焦』的任何程式視窗，不限瀏覽器。會跳出確認視窗給使用者。"
-            ),
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "text": {"type": "STRING", "description": "要輸入的文字內容"},
-                },
-                "required": ["text"],
-            },
-        )
-
-        keyboard_press_decl = types.FunctionDeclaration(
-            name="keyboard_press",
-            description="模擬按下單一按鍵，例如 enter、esc、tab、f5、up、down、left、right、backspace。這是電腦層級操作，會跳出確認視窗給使用者。",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "key": {"type": "STRING", "description": "按鍵名稱"},
-                },
-                "required": ["key"],
-            },
-        )
-
-        keyboard_hotkey_decl = types.FunctionDeclaration(
-            name="keyboard_hotkey",
-            description="模擬組合鍵，例如 'ctrl+c'、'ctrl+v'、'alt+tab'、'win+d'。這是電腦層級操作，會跳出確認視窗給使用者。",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "keys": {"type": "STRING", "description": "用加號分隔的按鍵組合，例如 'ctrl+c'"},
-                },
-                "required": ["keys"],
-            },
-        )
-
-        return [
-            types.Tool(
-                function_declarations=[
-                    schedule_shutdown_decl,
-                    shutdown_in_minutes_decl,
-                    cancel_shutdown_decl,
-                    open_browser_decl,
-                    open_app_decl,
-                    browser_navigate_decl,
-                    browser_click_decl,
-                    browser_type_text_decl,
-                    browser_press_enter_decl,
-                    browser_scroll_decl,
-                    browser_get_page_summary_decl,
-                    browser_close_decl,
-                    get_screen_size_decl,
-                    take_screenshot_decl,
-                    mouse_move_decl,
-                    mouse_click_decl,
-                    mouse_scroll_decl,
-                    keyboard_type_decl,
-                    keyboard_press_decl,
-                    keyboard_hotkey_decl,
-                ]
-            )
-        ]
-
-    def _build_system_instruction(self) -> str:
-        now = datetime.now()
-        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-        weekday_map = ["一", "二", "三", "四", "五", "六", "日"]
-        weekday_str = weekday_map[now.weekday()]
-
-        return (
-            f"你是一位名叫「{ASSISTANT_NAME}」的桌面語音助理，個性親切、簡潔、有效率，"
-            f"以繁體中文回應使用者。\n"
-            f"目前系統時間為：{now_str}（星期{weekday_str}）。\n"
-            f"當使用者提到與時間相關的關機需求時（例如「晚點關機」「半小時後關機」「晚上11點關機」），"
-            f"請你依照目前系統時間精準換算，並呼叫對應的工具函式完成任務，不要只用文字回答而不呼叫工具。\n"
-            f"若使用者只是想『開啟』某個網站或搜尋資訊（不需要進一步互動），請用 open_browser。\n"
-            f"若使用者想要你『操作』網頁——例如點擊按鈕、在欄位輸入文字、捲動頁面、幫忙填表單、"
-            f"查詢頁面上的資訊——請改用 browser_navigate 開啟頁面，並視需要搭配 "
-            f"browser_get_page_summary（先了解頁面內容）、browser_click、browser_type_text、"
-            f"browser_press_enter、browser_scroll 等工具完成任務，完成後可視情況呼叫 browser_close。\n"
-            f"操作瀏覽器時請每次只做一個明確步驟，並在必要時用 browser_get_page_summary 確認結果，"
-            f"避免連續盲目點擊。\n"
-            f"若使用者要求的是『電腦層級』的操作——控制瀏覽器以外的其他任意程式視窗，例如移動滑鼠、"
-            f"點擊螢幕上特定座標、輸入文字到某個軟體、按組合鍵（如 alt+tab、ctrl+c）——請使用 "
-            f"mouse_move、mouse_click、mouse_scroll、keyboard_type、keyboard_press、keyboard_hotkey "
-            f"這些工具。這些操作會自動跳出視窗請使用者確認，你不需要事先用文字再三詢問是否要執行，"
-            f"直接呼叫工具即可，系統會處理確認流程；若使用者拒絕，如實告知即可。"
-            f"需要座標時可先呼叫 get_screen_size 了解螢幕大小，或用 take_screenshot 截圖供使用者確認畫面狀態。\n"
-            f"若使用者想開啟應用程式，也請呼叫對應工具完成，而非只是用文字說明步驟。\n"
-            f"完成工具呼叫後，請用簡短自然的口語向使用者確認結果。"
-        )
-
-    def _dispatch_function_call(self, function_call) -> dict:
-        """執行單一 function call，回傳結果 dict。"""
-        name = function_call.name
-        args = dict(function_call.args) if function_call.args else {}
-        func = TOOL_FUNCTIONS.get(name)
-        if func is None:
-            return {"error": f"未知的工具：{name}"}
-        try:
-            result_text = func(**args)
-            return {"result": result_text}
-        except Exception as e:
-            return {"error": f"執行工具 {name} 時發生例外：{e}"}
-
     def send_message(self, user_text: str) -> str:
         """
         送出使用者訊息，處理可能的多輪 Function Calling，
@@ -1086,8 +1092,8 @@ class GeminiBrain:
             return "[AI 尚未就緒] 請檢查 API Key 與網路設定。"
 
         try:
-            tools = self._build_tools()
-            system_instruction = self._build_system_instruction()
+            tools = build_shared_tools()
+            system_instruction = build_shared_system_instruction()
 
             config = types.GenerateContentConfig(
                 system_instruction=system_instruction,
@@ -1124,7 +1130,7 @@ class GeminiBrain:
                 if function_calls:
                     function_response_parts = []
                     for fc in function_calls:
-                        result = self._dispatch_function_call(fc)
+                        result = dispatch_function_call(fc)
                         function_response_parts.append(
                             types.Part.from_function_response(
                                 name=fc.name,
@@ -1147,133 +1153,286 @@ class GeminiBrain:
 
 
 # ============================================================================
-#  文字轉語音（TTS）引擎封裝
+#  Gemini Live 即時語音對話引擎 —— 取代原本「錄音轉文字→問AI→轉語音」的拼接做法
+#  ----------------------------------------------------------------------
+#  通話模式下，麥克風收音會即時串流給 Gemini Live 模型，模型的語音回覆也是
+#  即時串流播放，具備原生的語音活動偵測（VAD）與可隨時打斷（barge-in）的能力，
+#  體感上更接近真的講電話，而不是「按下說話→等待→聽回覆」那種一問一答。
+#
+#  整個生命週期跑在獨立的背景執行緒 + 專屬的 asyncio event loop 中，
+#  透過建構子傳入的 callback（都會安全地排程回 GUI 主執行緒）跟介面溝通狀態。
 # ============================================================================
 
-class SpeechEngine:
+LIVE_MODEL_NAME = "gemini-3.1-flash-live-preview"  # Gemini 最新的即時語音（Audio-to-Audio）模型
+LIVE_SEND_SAMPLE_RATE = 16000     # 送給模型的麥克風音訊取樣率（16-bit PCM, mono）
+LIVE_RECEIVE_SAMPLE_RATE = 24000  # 模型回傳語音的取樣率
+LIVE_CHUNK_SIZE = 1024
+
+
+def list_input_devices():
     """
-    封裝 pyttsx3，提供非阻塞的文字轉語音功能。
-    使用獨立背景執行緒 + Queue 依序播放，避免多段語音互相打斷，
-    也避免在 GUI 執行緒中呼叫 runAndWait() 造成介面卡死。
+    列出系統上所有可用的麥克風（輸入）裝置。
+    Returns:
+        list[tuple[int, str]]：每個元素為 (裝置索引, 裝置名稱)。
+        若 pyaudio 未安裝或列舉失敗，回傳空list。
     """
-
-    def __init__(self):
-        self.available = False
-        self.error = None
-        self._queue = queue.Queue()
-        self.engine = None
-
-        if not PYTTSX3_AVAILABLE:
-            self.error = "尚未安裝 pyttsx3，請執行：pip install pyttsx3"
-            return
-
-        try:
-            self.engine = pyttsx3.init()
-            self.engine.setProperty("rate", 185)
-            self.engine.setProperty("volume", 1.0)
-            self._select_chinese_voice()
-            self.available = True
-        except Exception as e:
-            self.error = f"初始化語音引擎失敗：{e}"
-            return
-
-        threading.Thread(target=self._worker_loop, daemon=True).start()
-
-    def _select_chinese_voice(self):
-        """嘗試自動挑選系統中已安裝的中文語音（若無則使用系統預設）。"""
-        try:
-            voices = self.engine.getProperty("voices")
-            keywords = ["chinese", "mandarin", "zh-", "zh_cn", "zh_tw",
-                        "huihui", "yating", "hanhan", "taiwan", "zh"]
-            for v in voices:
-                blob = f"{getattr(v, 'name', '')} {getattr(v, 'id', '')}".lower()
-                if any(k in blob for k in keywords):
-                    self.engine.setProperty("voice", v.id)
-                    return
-        except Exception:
-            pass  # 找不到中文語音就使用系統預設語音
-
-    def _worker_loop(self):
-        """背景執行緒：依序從佇列取出文字並播放語音，確保同一時間只播一句。"""
-        while True:
-            text = self._queue.get()
-            if not text:
-                continue
+    if not PYAUDIO_AVAILABLE:
+        return []
+    devices = []
+    pa = None
+    try:
+        pa = pyaudio.PyAudio()
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
+            if info.get("maxInputChannels", 0) > 0:
+                devices.append((i, info.get("name", f"裝置 {i}")))
+    except Exception:
+        pass
+    finally:
+        if pa is not None:
             try:
-                self.engine.say(text)
-                self.engine.runAndWait()
+                pa.terminate()
+            except Exception:
+                pass
+    return devices
+
+
+class GeminiLiveController:
+    """
+    封裝 google-genai 的 Live API（client.aio.live.connect），
+    負責：麥克風即時收音 → 串流送給模型、接收模型語音串流 → 即時播放，
+    並支援與文字模式共用的 Function Calling 工具。
+    """
+
+    def __init__(self, api_key: str, base_url: str,
+                 on_status_change=None, on_transcript=None, on_error=None):
+        """
+        Args:
+            on_status_change: callback(connected: bool)，連線狀態改變時呼叫
+            on_transcript: callback(role: str, text: str)，role 為 'user' 或 'model'，
+                           有語音轉錄文字時呼叫（用來在聊天視窗顯示逐字稿）
+            on_error: callback(message: str)，發生錯誤時呼叫
+        """
+        self.api_key = api_key
+        self.base_url = base_url
+        self.on_status_change = on_status_change
+        self.on_transcript = on_transcript
+        self.on_error = on_error
+
+        self.available = GENAI_AVAILABLE and PYAUDIO_AVAILABLE
+        self.error = None
+        if not GENAI_AVAILABLE:
+            self.error = "尚未安裝 google-genai，請執行：pip install google-genai"
+        elif not PYAUDIO_AVAILABLE:
+            self.error = "尚未安裝 pyaudio（即時語音需要），請執行：pip install pyaudio"
+
+        self._pyaudio = None
+        self._loop = None
+        self._thread = None
+        self._session = None
+        self._mic_stream = None
+        self._speaker_stream = None
+        self._muted = False
+        self._active = False
+        self.input_device_index = None  # None = 使用系統預設麥克風
+
+    # ------------------------------------------------------------------
+    # 對外介面：啟動 / 停止 / 靜音切換 / 選擇麥克風
+    # ------------------------------------------------------------------
+    def set_input_device(self, device_index):
+        """
+        指定要使用的麥克風裝置索引（見 list_input_devices()）。
+        傳入 None 代表改回使用系統預設麥克風。
+        注意：若通話已經在進行中，需要結束通話再重新開始，設定才會生效
+        （麥克風串流一旦開啟就固定使用當時的裝置）。
+        """
+        self.input_device_index = device_index
+
+    def start(self):
+        """啟動 Live 對話（建立新的背景執行緒 + asyncio event loop）。非阻塞。"""
+        if not self.available:
+            if self.on_error:
+                self.on_error(self.error or "語音通話功能未啟用。")
+            return
+        if self._thread is not None and self._thread.is_alive():
+            return  # 已經在跑了
+        self._active = True
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """停止 Live 對話，關閉連線與音訊裝置。"""
+        self._active = False
+        if self._loop is not None and self._loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(self._async_stop(), self._loop)
             except Exception:
                 pass
 
-    def speak(self, text: str):
-        """將文字加入播放佇列（非阻塞，可安全從任意執行緒呼叫）。"""
-        if self.available and text:
-            self._queue.put(text)
+    def set_muted(self, muted: bool):
+        """靜音切換：靜音時仍持續連線，但不會把麥克風音訊送給模型。"""
+        self._muted = muted
 
-    def stop(self):
-        """清空佇列並嘗試立即停止目前的語音播放。"""
+    # ------------------------------------------------------------------
+    # 內部：背景執行緒 + asyncio 主流程
+    # ------------------------------------------------------------------
+    def _run_loop(self):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
         try:
-            while not self._queue.empty():
-                self._queue.get_nowait()
-        except Exception:
-            pass
-        try:
-            if self.engine:
-                self.engine.stop()
-        except Exception:
-            pass
-
-
-# ============================================================================
-#  語音辨識（STT）引擎封裝 —— 通話模式使用麥克風輸入
-# ============================================================================
-
-class VoiceInputEngine:
-    """
-    封裝 speech_recognition，提供「點擊開始說話 → 自動偵測停頓 → 轉成文字」
-    的錄音辨識功能。listen_and_transcribe() 為同步阻塞呼叫，
-    因此一律要在背景執行緒中呼叫，避免卡住 GUI。
-    """
-
-    def __init__(self):
-        self.available = False
-        self.error = None
-        self.recognizer = None
-
-        if not SR_AVAILABLE:
-            self.error = "尚未安裝語音辨識套件，請執行：pip install SpeechRecognition pyaudio"
-            return
-
-        try:
-            self.recognizer = sr.Recognizer()
-            self.recognizer.pause_threshold = 0.8  # 停頓超過 0.8 秒視為一句話講完
-            self.available = True
+            self._loop.run_until_complete(self._main())
         except Exception as e:
-            self.error = f"初始化語音辨識失敗：{e}"
+            if self.on_error:
+                self.on_error(f"語音通話發生錯誤：{e}")
+        finally:
+            if self.on_status_change:
+                self.on_status_change(False)
+            try:
+                self._loop.close()
+            except Exception:
+                pass
+            self._loop = None
 
-    def listen_and_transcribe(self, timeout: int = 6, phrase_time_limit: int = 20) -> str:
-        """
-        開啟麥克風錄音並轉成文字（繁體中文）。
-        Args:
-            timeout: 等待使用者「開始說話」的最長秒數，超過就放棄
-            phrase_time_limit: 單次錄音的最長秒數上限
-        Returns:
-            辨識出的文字（str）
-        Raises:
-            RuntimeError / sr.WaitTimeoutError / sr.UnknownValueError / sr.RequestError
-        """
-        if not self.available:
-            raise RuntimeError(self.error or "語音辨識未啟用")
+    async def _async_stop(self):
+        self._active = False
 
-        with sr.Microphone() as source:
-            self.recognizer.adjust_for_ambient_noise(source, duration=0.4)
-            audio = self.recognizer.listen(
-                source, timeout=timeout, phrase_time_limit=phrase_time_limit
-            )
+    async def _main(self):
+        http_options = types.HttpOptions(base_url=self.base_url) if self.base_url else None
+        client = (
+            genai.Client(api_key=self.api_key, http_options=http_options)
+            if http_options else genai.Client(api_key=self.api_key)
+        )
 
-        # 使用 Google 免費線上語音辨識（需要網路連線），語言設定為繁體中文
-        text = self.recognizer.recognize_google(audio, language="zh-TW")
-        return text
+        config = types.LiveConnectConfig(
+            response_modalities=["AUDIO"],
+            system_instruction=build_shared_system_instruction(voice_mode=True),
+            tools=build_shared_tools(),
+            input_audio_transcription={},
+            output_audio_transcription={},
+        )
+
+        self._pyaudio = pyaudio.PyAudio()
+        try:
+            async with client.aio.live.connect(model=LIVE_MODEL_NAME, config=config) as session:
+                self._session = session
+                if self.on_status_change:
+                    self.on_status_change(True)
+
+                mic_task = asyncio.ensure_future(self._send_audio_loop(session))
+                recv_task = asyncio.ensure_future(self._receive_loop(session))
+
+                # 只要 self._active 還是 True 就持續等待，直到使用者按下掛斷
+                while self._active:
+                    await asyncio.sleep(0.2)
+
+                mic_task.cancel()
+                recv_task.cancel()
+                for t in (mic_task, recv_task):
+                    try:
+                        await t
+                    except Exception:
+                        pass
+        finally:
+            self._cleanup_audio()
+            self._session = None
+
+    async def _send_audio_loop(self, session):
+        """持續讀取麥克風並串流送給模型（靜音時改送靜音資料，不中斷連線）。"""
+        # 若使用者透過 set_input_device() 指定了裝置就用該裝置，否則用系統預設麥克風
+        if self.input_device_index is not None:
+            device_index = self.input_device_index
+        else:
+            device_index = self._pyaudio.get_default_input_device_info()["index"]
+
+        self._mic_stream = await asyncio.to_thread(
+            self._pyaudio.open,
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=LIVE_SEND_SAMPLE_RATE,
+            input=True,
+            input_device_index=device_index,
+            frames_per_buffer=LIVE_CHUNK_SIZE,
+        )
+        try:
+            while True:
+                data = await asyncio.to_thread(
+                    self._mic_stream.read, LIVE_CHUNK_SIZE, exception_on_overflow=False
+                )
+                if self._muted:
+                    continue  # 靜音時不送出音訊，但連線與接收仍持續
+                await session.send_realtime_input(
+                    audio={"data": data, "mime_type": "audio/pcm"}
+                )
+        except asyncio.CancelledError:
+            pass
+
+    async def _receive_loop(self, session):
+        """接收模型的語音/文字回覆並即時播放，同時把逐字稿丟給 on_transcript。"""
+        self._speaker_stream = await asyncio.to_thread(
+            self._pyaudio.open,
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=LIVE_RECEIVE_SAMPLE_RATE,
+            output=True,
+        )
+        try:
+            while True:
+                turn = session.receive()
+                async for response in turn:
+                    server_content = getattr(response, "server_content", None)
+
+                    # 播放模型語音
+                    if server_content and server_content.model_turn:
+                        for part in server_content.model_turn.parts:
+                            inline = getattr(part, "inline_data", None)
+                            if inline and isinstance(inline.data, (bytes, bytearray)):
+                                await asyncio.to_thread(self._speaker_stream.write, inline.data)
+
+                    # 使用者語音轉錄文字
+                    input_transcript = getattr(server_content, "input_transcription", None) if server_content else None
+                    if input_transcript and getattr(input_transcript, "text", None):
+                        if self.on_transcript:
+                            self.on_transcript("user", input_transcript.text)
+
+                    # 模型語音轉錄文字
+                    output_transcript = getattr(server_content, "output_transcription", None) if server_content else None
+                    if output_transcript and getattr(output_transcript, "text", None):
+                        if self.on_transcript:
+                            self.on_transcript("model", output_transcript.text)
+
+                    # Function Calling：模型要求呼叫工具
+                    tool_call = getattr(response, "tool_call", None)
+                    if tool_call and getattr(tool_call, "function_calls", None):
+                        responses = []
+                        for fc in tool_call.function_calls:
+                            result = dispatch_function_call(fc)
+                            responses.append(
+                                types.FunctionResponse(
+                                    id=getattr(fc, "id", None),
+                                    name=fc.name,
+                                    response=result,
+                                )
+                            )
+                        await session.send_tool_response(function_responses=responses)
+        except asyncio.CancelledError:
+            pass
+
+    def _cleanup_audio(self):
+        for stream in (self._mic_stream, self._speaker_stream):
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
+        self._mic_stream = None
+        self._speaker_stream = None
+        if self._pyaudio is not None:
+            try:
+                self._pyaudio.terminate()
+            except Exception:
+                pass
+            self._pyaudio = None
 
 
 # ============================================================================
@@ -1329,12 +1488,12 @@ class ChatBubble(ctk.CTkFrame):
 class FloatingPill(ctk.CTkToplevel):
     """螢幕懸浮膠囊（PiP）視窗。"""
 
-    def __init__(self, master, on_restore, on_hangup, on_mic):
+    def __init__(self, master, on_restore, on_hangup, on_toggle_mute):
         super().__init__(master)
         self.master_app = master
         self.on_restore = on_restore
         self.on_hangup = on_hangup
-        self.on_mic = on_mic
+        self.on_toggle_mute = on_toggle_mute
 
         self.overrideredirect(True)
         self.attributes("-topmost", True)
@@ -1384,13 +1543,13 @@ class FloatingPill(ctk.CTkToplevel):
         )
         self.hangup_btn.pack(side="right", padx=2)
 
-        # 通話模式下的「點擊說話」麥克風按鈕：最小化後仍可用語音對話
-        self.mic_btn = ctk.CTkButton(
+        # Gemini Live 通話期間持續自動聆聽，這裡只需要一個「靜音麥克風」開關
+        self.mute_btn = ctk.CTkButton(
             self.frame, text="🎤", width=32, height=32, corner_radius=16,
             fg_color=COLOR_ACCENT, hover_color="#3f8ae0",
-            command=self._mic,
+            command=self._toggle_mute,
         )
-        self.mic_btn.pack(side="right", padx=2)
+        self.mute_btn.pack(side="right", padx=2)
 
         # 拖曳移動
         self._drag_x = 0
@@ -1414,15 +1573,15 @@ class FloatingPill(ctk.CTkToplevel):
     def _hangup(self):
         self.on_hangup()
 
-    def _mic(self):
-        self.on_mic()
+    def _toggle_mute(self):
+        self.on_toggle_mute()
 
-    def set_mic_listening(self, listening: bool):
-        """聆聽中時把麥克風按鈕變色，給使用者明確回饋。"""
-        if listening:
-            self.mic_btn.configure(fg_color=COLOR_DANGER, hover_color="#c0392b", state="disabled")
+    def set_mic_muted(self, muted: bool):
+        """更新麥克風按鈕的顏色，反映目前是否靜音。"""
+        if muted:
+            self.mute_btn.configure(text="🔇", fg_color=COLOR_DANGER, hover_color="#c0392b")
         else:
-            self.mic_btn.configure(fg_color=COLOR_ACCENT, hover_color="#3f8ae0", state="normal")
+            self.mute_btn.configure(text="🎤", fg_color=COLOR_ACCENT, hover_color="#3f8ae0")
 
     def set_status(self, online: bool):
         self.status_dot.configure(text_color=COLOR_ONLINE if online else COLOR_STANDBY)
@@ -1437,25 +1596,26 @@ class AssistantApp(ctk.CTk):
         self.minsize(400, 600)
         self.configure(fg_color=COLOR_BG)
 
-        self.is_online = False
-        self.is_muted = False
         self.pill_window = None
-        self.mode = "text"          # "text" 文字模式 / "call" 通話模式（只能語音）
-        self.is_listening = False   # 目前是否正在錄音辨識中
+        self.mode = "text"          # "text" 文字模式 / "call" 通話模式（Gemini Live 即時語音）
+        self.live_connected = False
+        self.mic_muted = False
 
         self.brain = GeminiBrain(GEMINI_API_KEY, PROXY_BASE_URL, MODEL_NAME)
-        self.speech = SpeechEngine()
-        self.voice_input = VoiceInputEngine()
+        self.live_controller = GeminiLiveController(
+            GEMINI_API_KEY, PROXY_BASE_URL,
+            on_status_change=self._on_live_status_change,
+            on_transcript=self._on_live_transcript,
+            on_error=self._on_live_error,
+        )
         register_app_instance(self)  # 讓電腦層級工具（滑鼠/鍵盤）能呼叫本視窗跳出確認彈窗
 
         self._build_ui()
 
         if self.brain.error:
             self._append_bubble(f"⚠️ {self.brain.error}", is_user=False)
-        if self.speech.error:
-            self._append_bubble(f"⚠️ 語音回覆功能未啟用：{self.speech.error}", is_user=False)
-        if self.voice_input.error:
-            self._append_bubble(f"⚠️ 通話模式（麥克風輸入）未啟用：{self.voice_input.error}", is_user=False)
+        if self.live_controller.error:
+            self._append_bubble(f"⚠️ 通話模式（Gemini Live 語音）未啟用：{self.live_controller.error}", is_user=False)
         if not PYAUTOGUI_AVAILABLE:
             self._append_bubble(
                 "⚠️ 電腦層級操作（滑鼠/鍵盤自動化）未啟用：請執行 pip install pyautogui pyperclip",
@@ -1586,56 +1746,60 @@ class AssistantApp(ctk.CTk):
         )
         self.send_btn.pack(side="right", padx=(0, 12), pady=10)
 
-        # (B) 通話模式：不能打字，只能點擊麥克風說話
+        # (B) 通話模式：不能打字，Gemini Live 會持續聆聽，不用手動按著說話
         self.call_input_bar = ctk.CTkFrame(self.input_container, fg_color=COLOR_PANEL, corner_radius=0)
 
-        self.call_mic_status_label = ctk.CTkLabel(
-            self.call_input_bar, text="點擊下方麥克風開始說話",
-            font=ctk.CTkFont(size=12), text_color=COLOR_STANDBY,
+        self.call_status_label = ctk.CTkLabel(
+            self.call_input_bar, text="🔴 通話中，請直接開始說話...",
+            font=ctk.CTkFont(size=13), text_color=COLOR_ONLINE,
         )
-        self.call_mic_status_label.pack(pady=(10, 4))
+        self.call_status_label.pack(pady=(14, 4))
 
-        self.call_mic_btn = ctk.CTkButton(
-            self.call_input_bar, text="🎤", width=64, height=64, corner_radius=32,
-            fg_color=COLOR_ACCENT, hover_color="#3f8ae0",
-            font=ctk.CTkFont(size=22),
-            command=self._start_listening,
+        # 麥克風選擇下拉選單：預設「系統預設麥克風」，也可指定特定裝置
+        self._mic_name_to_index = {}  # 顯示字串 -> 裝置索引（None 代表系統預設）
+        self.mic_select_menu = ctk.CTkOptionMenu(
+            self.call_input_bar, values=["系統預設麥克風"],
+            width=260, command=self._on_mic_selected,
+            fg_color="#21262d", button_color="#30363d", button_hover_color="#3a4149",
         )
-        self.call_mic_btn.pack(pady=(0, 12))
+        self.mic_select_menu.pack(pady=(0, 8))
+        self._refresh_mic_options()
+
+        call_btn_row = ctk.CTkFrame(self.call_input_bar, fg_color="transparent")
+        call_btn_row.pack(pady=(0, 14))
+
+        self.call_mute_btn = ctk.CTkButton(
+            call_btn_row, text="🎤 靜音麥克風", width=140, height=40, corner_radius=20,
+            fg_color="#21262d", hover_color="#30363d",
+            command=self._toggle_live_mute,
+        )
+        self.call_mute_btn.pack(side="left", padx=8)
+
+        self.end_call_btn = ctk.CTkButton(
+            call_btn_row, text="🛑 結束通話", width=140, height=40, corner_radius=20,
+            fg_color=COLOR_DANGER, hover_color="#c0392b",
+            command=self._end_call,
+        )
+        self.end_call_btn.pack(side="left", padx=8)
 
         # 預設顯示文字模式列
         self.text_input_bar.pack(side="top", fill="x")
 
-        # ---- 底部通話控制列 ----
-        control_bar = ctk.CTkFrame(self, fg_color=COLOR_PANEL, corner_radius=0, height=64)
-        control_bar.pack(side="top", fill="x")
+        # ---- 底部：只留一個「開新對話」按鈕，取消排程請直接跟鎮宇說/打字即可 ----
+        bottom_bar = ctk.CTkFrame(self, fg_color=COLOR_PANEL, corner_radius=0, height=56)
+        bottom_bar.pack(side="top", fill="x")
 
-        # 注意：目前沒有語音辨識（輸入），此按鈕控制的是「語音輸出」開關——
-        # 也就是鎮宇回覆時是否要用語音唸出來（文字輸入方式不受影響）。
-        self.mic_btn = ctk.CTkButton(
-            control_bar, text="🔊 語音回覆", width=110, height=40, corner_radius=20,
+        self.new_chat_btn = ctk.CTkButton(
+            bottom_bar, text="🆕 新對話", width=140, height=38, corner_radius=19,
             fg_color="#21262d", hover_color="#30363d",
-            command=self._toggle_mute,
+            command=self._new_conversation,
         )
-        self.mic_btn.pack(side="left", padx=14, pady=12)
-
-        self.call_btn = ctk.CTkButton(
-            control_bar, text="📞 接通", width=110, height=40, corner_radius=20,
-            fg_color=COLOR_ONLINE, hover_color="#2ea043",
-            command=self._toggle_call,
-        )
-        self.call_btn.pack(side="left", padx=6, pady=12, expand=True)
-
-        self.cancel_shutdown_btn = ctk.CTkButton(
-            control_bar, text="⏹ 取消關機", width=110, height=40, corner_radius=20,
-            fg_color=COLOR_DANGER, hover_color="#c0392b",
-            command=self._quick_cancel_shutdown,
-        )
-        self.cancel_shutdown_btn.pack(side="right", padx=14, pady=12)
+        self.new_chat_btn.pack(pady=10)
 
         self._append_bubble(
             f"您好，我是 {ASSISTANT_NAME}。「💬 文字模式」可以像打字聊天一樣輸入訊息；"
-            f"切換到「📞 通話模式」則不能打字，只能點擊麥克風說話，我也會用語音回覆您。",
+            f"切換到「📞 通話模式」會開始 Gemini Live 即時語音通話，直接開口說話就好，"
+            f"不用按著麥克風，講到一半也可以隨時插話打斷我。",
             is_user=False,
         )
 
@@ -1648,69 +1812,128 @@ class AssistantApp(ctk.CTk):
         self.after(50, lambda: self.chat_frame._parent_canvas.yview_moveto(1.0))
 
     # ------------------------------------------------------------------
-    # 狀態切換
+    # 狀態列（只反映目前模式與 Live 連線狀態，不再有獨立的「接通」概念）
     # ------------------------------------------------------------------
-    def _set_online(self, online: bool):
-        self.is_online = online
-        if online:
+    def _refresh_status_bar(self):
+        if self.mode == "call" and self.live_connected:
             self.status_label.configure(text="●  ONLINE", text_color=COLOR_ONLINE)
-            self.call_state_label.configure(text="通話中", text_color=COLOR_ONLINE)
-            self.call_btn.configure(
-                text="🛑 掛斷", fg_color=COLOR_DANGER, hover_color="#c0392b",
-            )
+            self.call_state_label.configure(text="語音通話中", text_color=COLOR_ONLINE)
+        elif self.mode == "call":
+            self.status_label.configure(text="●  連線中...", text_color=COLOR_ACCENT)
+            self.call_state_label.configure(text="正在連線 Gemini Live...", text_color=COLOR_ACCENT)
         else:
             self.status_label.configure(text="●  STANDBY", text_color=COLOR_STANDBY)
-            self.call_state_label.configure(text="尚未接通", text_color=COLOR_STANDBY)
-            self.call_btn.configure(
-                text="📞 接通", fg_color=COLOR_ONLINE, hover_color="#2ea043",
-            )
-        if self.pill_window is not None:
-            self.pill_window.set_status(online)
+            self.call_state_label.configure(text="文字模式", text_color=COLOR_STANDBY)
+        if self.pill_window is not None and self.pill_window.winfo_exists():
+            self.pill_window.set_status(self.mode == "call" and self.live_connected)
 
-    def _toggle_call(self):
-        self._set_online(not self.is_online)
-        if self.is_online:
-            self._append_bubble("通話已接通，請開始說話或輸入訊息。", is_user=False)
-        else:
-            self.speech.stop()
-            self._append_bubble("通話已結束。", is_user=False)
+    def _new_conversation(self):
+        """開新對話：清空聊天紀錄與畫面，若在通話中會一併結束通話。"""
+        if self.mode == "call":
+            self.live_controller.stop()
+            self.mode = "text"
+            self.call_input_bar.pack_forget()
+            self.text_input_bar.pack(side="top", fill="x")
+            self.mode_switch.set("💬 文字模式")
 
-    def _toggle_mute(self):
-        self.is_muted = not self.is_muted
-        if self.is_muted:
-            self.mic_btn.configure(text="🔇 已靜音", fg_color=COLOR_DANGER, hover_color="#c0392b")
-            self.speech.stop()  # 立即停止目前正在播放的語音
-        else:
-            self.mic_btn.configure(text="🔊 語音回覆", fg_color="#21262d", hover_color="#30363d")
-
-    def _quick_cancel_shutdown(self):
-        self._append_bubble("正在取消排程關機...", is_user=False)
-
-        def worker():
-            result = cancel_shutdown()
-            self.after(0, lambda: self._append_bubble(result, is_user=False))
-
-        threading.Thread(target=worker, daemon=True).start()
+        self.brain.chat_history = []
+        for widget in self.chat_frame.winfo_children():
+            widget.destroy()
+        self._refresh_status_bar()
+        self._append_bubble(f"已開始新的對話。我是 {ASSISTANT_NAME}，有什麼可以幫你的嗎？", is_user=False)
 
     # ------------------------------------------------------------------
-    # 模式切換：文字模式（打字） ／ 通話模式（只能靠麥克風）
+    # 模式切換：文字模式（打字） ／ 通話模式（Gemini Live 即時語音）
     # ------------------------------------------------------------------
     def _on_mode_change(self, value: str):
         if "通話" in value:
             self.mode = "call"
             self.text_input_bar.pack_forget()
             self.call_input_bar.pack(side="top", fill="x")
-            if not self.is_online:
-                self._set_online(True)
-            self._append_bubble("已切換到通話模式：無法打字，請點擊下方麥克風開始說話。", is_user=False)
+            self.mic_muted = False
+            self.call_mute_btn.configure(text="🎤 靜音麥克風", fg_color="#21262d", hover_color="#30363d")
+            self._refresh_mic_options()
+            self._append_bubble("正在連線 Gemini Live，請稍候...", is_user=False)
+            self._refresh_status_bar()
+            self.live_controller.start()
         else:
+            if self.mode == "call":
+                self.live_controller.stop()
             self.mode = "text"
             self.call_input_bar.pack_forget()
             self.text_input_bar.pack(side="top", fill="x")
+            self._refresh_status_bar()
             self._append_bubble("已切換到文字模式，可以直接輸入文字對話。", is_user=False)
 
+    def _refresh_mic_options(self):
+        """重新掃描系統上的麥克風清單，更新下拉選單內容（盡量保留使用者原本的選擇）。"""
+        previous_selection = self.mic_select_menu.get() if hasattr(self, "mic_select_menu") else "系統預設麥克風"
+        devices = list_input_devices()
+        self._mic_name_to_index = {"系統預設麥克風": None}
+        values = ["系統預設麥克風"]
+        for idx, name in devices:
+            # 避免不同裝置同名造成選單顯示混淆，附上索引編號
+            display = f"{name} (#{idx})"
+            self._mic_name_to_index[display] = idx
+            values.append(display)
+        self.mic_select_menu.configure(values=values)
+        # 若先前選擇的裝置仍然存在就保留，否則退回系統預設
+        self.mic_select_menu.set(previous_selection if previous_selection in values else values[0])
+
+    def _on_mic_selected(self, selected: str):
+        device_index = self._mic_name_to_index.get(selected)
+        self.live_controller.set_input_device(device_index)
+        if self.mode == "call" and self.live_connected:
+            self._append_bubble(
+                "已記住這個麥克風選擇，請按「🛑 結束通話」後重新切換到通話模式，設定才會套用。",
+                is_user=False,
+            )
+
+    def _end_call(self):
+        """結束通話：停止 Gemini Live、切回文字模式。"""
+        self.live_controller.stop()
+        self.mode = "text"
+        self.call_input_bar.pack_forget()
+        self.text_input_bar.pack(side="top", fill="x")
+        self.mode_switch.set("💬 文字模式")
+        self.live_connected = False
+        self._refresh_status_bar()
+        self._append_bubble("通話已結束。", is_user=False)
+
+    def _toggle_live_mute(self):
+        self.mic_muted = not self.mic_muted
+        self.live_controller.set_muted(self.mic_muted)
+        if self.mic_muted:
+            self.call_mute_btn.configure(text="🔇 已靜音", fg_color=COLOR_DANGER, hover_color="#c0392b")
+        else:
+            self.call_mute_btn.configure(text="🎤 靜音麥克風", fg_color="#21262d", hover_color="#30363d")
+        if self.pill_window is not None and self.pill_window.winfo_exists():
+            self.pill_window.set_mic_muted(self.mic_muted)
+
     # ------------------------------------------------------------------
-    # 訊息送出與 AI 呼叫（皆在背景執行緒，確保 GUI 不卡死）
+    # Gemini Live callback（由背景執行緒呼叫，內部都會排程回主執行緒）
+    # ------------------------------------------------------------------
+    def _on_live_status_change(self, connected: bool):
+        def update():
+            self.live_connected = connected
+            self._refresh_status_bar()
+            if not connected and self.mode == "call":
+                # 連線意外中斷（非使用者主動掛斷）
+                self._append_bubble("與 Gemini Live 的連線已中斷。", is_user=False)
+        self.after(0, update)
+
+    def _on_live_transcript(self, role: str, text: str):
+        def update():
+            self._append_bubble(text, is_user=(role == "user"))
+        self.after(0, update)
+
+    def _on_live_error(self, message: str):
+        def update():
+            self._append_bubble(f"⚠️ {message}", is_user=False)
+        self.after(0, update)
+
+    # ------------------------------------------------------------------
+    # 訊息送出與 AI 呼叫（文字模式專用，皆在背景執行緒，確保 GUI 不卡死）
     # ------------------------------------------------------------------
     def _on_send(self):
         user_text = self.entry.get().strip()
@@ -1720,12 +1943,9 @@ class AssistantApp(ctk.CTk):
         self._send_text(user_text)
 
     def _send_text(self, user_text: str):
-        """統一的送出邏輯：文字模式打字送出、通話模式語音辨識完成後都會呼叫這裡。"""
+        """文字模式的送出邏輯：純文字問答，不會觸發任何語音播放。"""
         if not user_text:
             return
-
-        if not self.is_online:
-            self._set_online(True)
 
         self._append_bubble(user_text, is_user=True)
         self._append_bubble("思考中...", is_user=False)
@@ -1740,51 +1960,6 @@ class AssistantApp(ctk.CTk):
                 except Exception:
                     pass
                 self._append_bubble(reply_text, is_user=False)
-                # 若目前在通話中且未靜音，將 AI 回覆用語音唸出來
-                if self.is_online and not self.is_muted:
-                    self.speech.speak(reply_text)
-
-            self.after(0, update_ui)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    # ------------------------------------------------------------------
-    # 通話模式：麥克風語音輸入（STT）
-    # ------------------------------------------------------------------
-    def _start_listening(self):
-        """點擊麥克風開始錄音辨識；主視窗與懸浮膠囊共用這個方法。"""
-        if self.is_listening:
-            return
-        if not self.voice_input.available:
-            self._append_bubble(f"⚠️ {self.voice_input.error}", is_user=False)
-            return
-
-        self.is_listening = True
-        self.call_mic_btn.configure(state="disabled", fg_color=COLOR_DANGER, hover_color="#c0392b")
-        self.call_mic_status_label.configure(text="🎧 聆聽中，請開始說話...")
-        if self.pill_window is not None and self.pill_window.winfo_exists():
-            self.pill_window.set_mic_listening(True)
-
-        def worker():
-            text, err = None, None
-            try:
-                text = self.voice_input.listen_and_transcribe()
-            except Exception as e:
-                err = str(e)
-
-            def update_ui():
-                self.is_listening = False
-                self.call_mic_btn.configure(
-                    state="normal", fg_color=COLOR_ACCENT, hover_color="#3f8ae0"
-                )
-                self.call_mic_status_label.configure(text="點擊下方麥克風開始說話")
-                if self.pill_window is not None and self.pill_window.winfo_exists():
-                    self.pill_window.set_mic_listening(False)
-
-                if text:
-                    self._send_text(text)
-                elif err:
-                    self._append_bubble(f"⚠️ 語音辨識失敗：{err}", is_user=False)
 
             self.after(0, update_ui)
 
@@ -1798,9 +1973,10 @@ class AssistantApp(ctk.CTk):
         if self.pill_window is None or not self.pill_window.winfo_exists():
             self.pill_window = FloatingPill(
                 self, on_restore=self._exit_pip_mode, on_hangup=self._pip_hangup,
-                on_mic=self._start_listening,
+                on_toggle_mute=self._toggle_live_mute,
             )
-            self.pill_window.set_status(self.is_online)
+            self.pill_window.set_status(self.mode == "call" and self.live_connected)
+            self.pill_window.set_mic_muted(self.mic_muted)
         else:
             self.pill_window.deiconify()
 
@@ -1812,12 +1988,17 @@ class AssistantApp(ctk.CTk):
         self.focus_force()
 
     def _pip_hangup(self):
-        self._set_online(False)
+        if self.mode == "call":
+            self._end_call()
         self._exit_pip_mode()
 
     def _on_close(self):
         if self.pill_window is not None and self.pill_window.winfo_exists():
             self.pill_window.destroy()
+        try:
+            self.live_controller.stop()
+        except Exception:
+            pass
         try:
             browser_controller.close()
         except Exception:
