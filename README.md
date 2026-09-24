@@ -34,10 +34,18 @@
   沒有專屬的「取消關機」按鈕——想取消關機，直接跟鎮宇說或打字說「取消關機」就好
 
 ### AI 對話（文字模式）
-- `google-genai` SDK，模型 `gemini-3.6-flash`
+- `google-genai` SDK，模型 `gemini-3.5-flash-lite`（免費額度比 `gemini-3.6-flash` 寬鬆很多，適合日常測試）
 - System Instruction 動態帶入目前系統時間，供精準換算關機時間
 - 支援反代中繼站（`PROXY_BASE_URL`）
 - 多輪 Function Calling（最多連續 5 輪）
+
+### 本地模型分流（Ollama，省雲端額度）
+- 一般閒聊優先交給本地 **Ollama**（`OllamaBrain`）處理，完全不消耗 Gemini 額度
+- 訊息內容若命中 `CLOUD_TOOL_KEYWORDS` 關鍵字清單（瀏覽器、點擊、滑鼠鍵盤、開應用程式、關機等）
+  ，判斷為需要精準 Function Calling 的任務，一律直接走雲端 `GeminiBrain`，不會交給本地模型
+- 本地 Ollama 服務沒開、或呼叫失敗，會自動無縫 fallback 回雲端，不會卡住
+- 來自本地模型的回覆會在氣泡前加上 🖥️ 標示，方便分辨是哪邊回答的
+- 由 `OLLAMA_ENABLED` 開關控制是否啟用整套分流機制（見下方「設定」章節）
 
 ### 即時語音通話（通話模式，Gemini Live）
 - 模型：`gemini-3.1-flash-live-preview`（Google 最新的 Audio-to-Audio 即時語音模型）
@@ -79,6 +87,13 @@ pipwin install pyaudio
 > 只想先看介面、不想裝齊所有依賴？只裝 `customtkinter` 也能啟動，
 > 未安裝的功能（AI / 通話模式 / 瀏覽器自動化 / 電腦層級自動化）會顯示提示訊息，不會讓程式崩潰。
 
+**本地模型分流（可選）：** 若要啟用 `OLLAMA_ENABLED`，另外需要安裝 [Ollama](https://ollama.com)
+（獨立安裝程式，不是 pip 套件）並下載模型：
+
+```bash
+ollama pull qwen2.5:7b
+```
+
 ---
 
 ## 設定
@@ -88,9 +103,12 @@ pipwin install pyaudio
 ```python
 GEMINI_API_KEY = "你的 Gemini API Key"
 PROXY_BASE_URL = ""              # 若使用反代中繼站才填，留空則用官方端點
-MODEL_NAME = "gemini-3.6-flash"
+MODEL_NAME = "gemini-3.5-flash-lite"
 ASSISTANT_NAME = "鎮宇"
 REQUIRE_ACTION_CONFIRMATION = True   # 電腦層級滑鼠/鍵盤操作是否需要彈窗確認，見下方說明
+OLLAMA_ENABLED = True                # 是否啟用本地模型分流，見下方說明
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_MODEL = "qwen2.5:7b"          # VRAM 較小可改用 "qwen2.5:3b" 或 "llama3.2:3b"
 ```
 
 ### 關於 `REQUIRE_ACTION_CONFIRMATION`
@@ -101,11 +119,28 @@ REQUIRE_ACTION_CONFIRMATION = True   # 電腦層級滑鼠/鍵盤操作是否需�
 > 關閉確認後，鎮宇對滑鼠鍵盤的操作將完全不等你同意就執行，請自行評估風險。
 > 開啟應用程式（`open_app`）不受此開關影響，一律會先跳出「ℹ️ 即將開啟應用程式：xxx」的提示訊息再實際開啟。
 
+### 關於本地模型分流（`OLLAMA_ENABLED`）
+
+1. 先到 [ollama.com](https://ollama.com) 安裝 Ollama
+2. 下載模型：`ollama pull qwen2.5:7b`（或你在 `OLLAMA_MODEL` 設定的其他模型）
+3. 確保 Ollama 服務有在跑（安裝完通常會自動啟動；沒有的話開終端機執行 `ollama serve`）
+
+分流規則：
+- 一般聊天訊息 → 先送本地 Ollama，回覆前會加上 🖥️ 標示
+- 訊息命中 `CLOUD_TOOL_KEYWORDS`（瀏覽器、滑鼠鍵盤、開應用程式、關機等關鍵字）→ 直接走雲端 Gemini，不經過本地模型
+- 本地 Ollama 沒開或呼叫失敗 → 自動 fallback 回雲端 Gemini，不會卡住等待
+
+把 `OLLAMA_ENABLED` 設成 `False` 可以完全關閉這套分流，所有文字對話都固定走雲端 Gemini（回到原本行為）。
+
+> `OLLAMA_MODEL` 預設 `qwen2.5:7b`，若顯卡 VRAM 較小（例如 6GB 以下）建議改用
+> `qwen2.5:3b` 或 `llama3.2:3b` 這類更輕量的模型，推理速度會快很多。
+
 ### 關於通話模式所用的模型
 
 `GeminiLiveController` 內的 `LIVE_MODEL_NAME`（目前為 `"gemini-3.1-flash-live-preview"`）是獨立於
 `MODEL_NAME` 的設定，因為 Live（即時語音）跟一般文字生成用的不是同一個模型系列。
 Google 這塊更新較快，如果之後遇到「模型已下架」的錯誤，需要另外更新這個常數。
+通話模式（Gemini Live）**不受 `OLLAMA_ENABLED` 影響**，一律走雲端，因為目前沒有好用的本地即時語音替代方案。
 
 ---
 
@@ -179,6 +214,12 @@ python ai_assistant.py
   尚未在真實麥克風/喇叭硬體上實測過，第一次執行若遇到 API 細節不符（例如回傳欄位命名微調），
   可能需要對照 Google 官方 Live API 文件（https://ai.google.dev/api/live）微調程式碼
 - 通話模式需要網路連線（Gemini Live 走 WebSocket 串流）
+- **本地模型分流是關鍵字判斷**（`CLOUD_TOOL_KEYWORDS`），不是語意理解，可能誤判：
+  例如一句話裡剛好提到「螢幕」但其實只是閒聊，也會被歸類成需要雲端處理；
+  反之，如果指令沒用到清單裡的關鍵字、但語意上其實需要操作電腦，可能會被誤送到本地模型
+  （本地模型沒有工具可呼叫，頂多用文字回答做不到）
+- 本地模型（Ollama）回覆品質、中文能力、Function Calling 準確度通常不如雲端 Gemini，
+  這正是把操作類任務保留給雲端的原因
 - 瀏覽器自動化沒有額外二次確認機制，請避免請它操作涉及刪除／付款／轉帳的頁面
 - 電腦層級滑鼠/鍵盤操作若關閉了 `REQUIRE_ACTION_CONFIRMATION`，操作範圍就是**當下整台電腦的作用中視窗**，請留意
 - 沒有檔案讀寫、軟體安裝移除、系統設定變更等能力
